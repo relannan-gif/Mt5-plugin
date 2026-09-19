@@ -1662,3 +1662,531 @@ telemetry — which is currently **unknown**.
 | REQ-BLD-15 | Licensed SDK files and production credentials MUST NOT appear in redistributable artifacts or in this repository (REQ-AR-06) |
 
 ---
+
+## 14. Verification and acceptance plan
+
+> ### ⚠️ EXECUTION STATUS: **ALL TESTS BELOW ARE `NOT RUN`.**
+> No SDK, no MT5 server, no gateway, no payment sandbox was available. Nothing in this section has
+> been executed, compiled, or observed. Every row is a specification of a test to be performed.
+> **No test result, pass, or coverage figure may be reported from this document.**
+
+### 14.1 Test layers — and what each can and cannot prove
+
+**REQ-TST-01.** Results from one layer MUST NOT be presented as evidence for another.
+
+| Layer | Environment | Proves | **Cannot prove** | Status |
+|---|---|---|---|---|
+| **L1 Policy unit/property** | None — pure C++ | §5 decision logic is correct | Nothing about MT5, hooks, or coverage | **Runnable today. NOT RUN** |
+| **L2 Adapter compile/ABI** | SDK headers | Declarations match; ABI links; ownership rules compile | Runtime behaviour | **Blocked — no SDK. NOT RUN** |
+| **L3 MT5 integration** | Live MT5 test server | Hooks fire; decisions take effect; **coverage is real** | Gateway/LP and payment behaviour | **Blocked. NOT RUN** |
+| **L4 Gateway** | Test gateway + LP sim | External routing/cancellation/late fills | Payment behaviour | **Blocked. NOT RUN** |
+| **L5 Payment integration** | CRM + PSP sandbox | Pre-charge gate prevents movement | MT5 trading behaviour | **Blocked. NOT RUN** |
+| **L6 Operational resilience** | Full staging + failover | Restart, failover, partition, load | Correctness of decisions | **Blocked. NOT RUN** |
+
+**REQ-TST-02 (MUST).** **Synthetic arithmetic checks cannot prove live callback coverage or
+production safety.** A green L1 suite proves the *rules* are right; it says nothing about whether
+the plugin is ever *asked*. Acceptance requires L3 evidence for every "Prevent" row in §4.1.
+
+**REQ-TST-03.** Every test MUST capture **callback evidence**: which hook fired, at which stage,
+with which parameters populated/NULL, what was returned, and the observed platform effect. A test
+that records only the final outcome cannot distinguish "the plugin prevented it" from "it failed
+for an unrelated reason" — and that distinction is the entire point.
+
+### 14.2 L1 — Policy unit and property tests (runnable now)
+
+**Property tests (invariants that MUST hold for all generated inputs):**
+
+| ID | Property |
+|---|---|
+| P-01 | An allowed netting decision never yields `\|V+r\| ≥ \|V\|` |
+| P-02 | An allowed netting decision never changes `sign(V)` except to zero |
+| P-03 | An allowed hedging decision never increases any position's volume |
+| P-04 | No unrestricted account's decision differs from `ALLOW` for any input (REQ-BR-04, transfers excepted) |
+| P-05 | No input produces `ALLOW` via an arithmetic overflow path |
+| P-06 | No float appears on the authorisation path (static check, §13.3) |
+| P-07 | Reservations never permit `Σ allowed reductions > position volume` (§10.5) |
+| P-08 | Every action enumerator maps to exactly one `ActionClass`; unknown ⇒ DENY |
+
+**Worked-example tests — netting, existing `BUY 1.00`:**
+
+| ID | Req | Requested | Expected | Before → After |
+|---|---|---|---|---|
+| T-NT-001 | REQ-TR-06 | SELL 0.40 | **ALLOW** `REASON_REDUCE_ONLY_OK` | BUY 1.00 → BUY 0.60 |
+| T-NT-002 | REQ-TR-05 | SELL 1.00 | **ALLOW** `REASON_REDUCE_ONLY_OK` | BUY 1.00 → flat |
+| T-NT-003 | REQ-TR-02 | BUY 0.20 | **DENY** `ERR_VOLUME_INCREASE` | BUY 1.00 → BUY 1.00 |
+| T-NT-004 | REQ-TR-04 | SELL 1.20 | **DENY** `ERR_REVERSAL` | BUY 1.00 → BUY 1.00 |
+| T-NT-005 | REQ-TR-01 | SELL 0.40 after position closed | **DENY** `ERR_NEW_POSITION` | flat → flat |
+| T-NT-006 | REQ-TR-23 | SELL 1.0000001 (sub-step) | **DENY** `ERR_VOLUME_INVALID` | unchanged |
+| T-NT-007 | REQ-TR-24 | Volume near `INT64_MAX` | **DENY** `ERR_ARITHMETIC` | unchanged |
+
+**Hedging:**
+
+| ID | Req | Scenario | Expected |
+|---|---|---|---|
+| T-HG-001 | REQ-TR-06 | Ticket-targeted opposite, volume < position | **ALLOW** |
+| T-HG-002 | REQ-TR-05 | Ticket-targeted opposite, volume == position | **ALLOW** |
+| T-HG-003 | REQ-TR-28 | Ticket-targeted opposite, volume > position | **DENY** `ERR_OVERSIZED_CLOSE` — **and volume NOT clamped** |
+| T-HG-004 | REQ-TR-03 | Untargeted opposite-side order | **DENY** `ERR_OPPOSING_HEDGE` |
+| T-HG-005 | REQ-TR-02 | Same-direction order | **DENY** `ERR_VOLUME_INCREASE` |
+| T-HG-006 | REQ-TR-21 | Ticket owned by another account | **DENY** `ERR_OWNERSHIP` + security audit |
+| T-HG-007 | REQ-TR-38 | Ticket of a closed position | **DENY** |
+| **T-HG-008** | **REQ-TR-10** | **Hold BUY 1.00 + SELL 1.00; close the SELL leg** | **ALLOW** — net exposure rises 0 → +1.00. **Must NOT be denied.** Critical false-denial test |
+
+**SL/TP:**
+
+| ID | Req | Scenario | Expected |
+|---|---|---|---|
+| T-SL-001..003 | REQ-TR-07 | SL/TP add · modify · remove | **ALLOW** `REASON_SLTP_ONLY` |
+| T-SL-004 | PD-04/05 | Widen SL; tighten SL | **ALLOW** both |
+| T-SL-005 | REQ-TR-35 | SL change bundled with volume change | **DENY** `ERR_SLTP_WITH_VOLUME`; **nothing applied** |
+| T-SL-006 | REQ-TR-35 | SL change bundled with open-price change | **DENY** `ERR_SLTP_WITH_PRICE` |
+| T-SL-007 | REQ-TR-35 | SL change bundled with ownership change | **DENY** `ERR_SLTP_WITH_OWNERSHIP` |
+| T-SL-008 | REQ-TR-36 | Trailing-stop-generated update | **ALLOW**; no server-side trailing service introduced |
+| T-SL-009 | REQ-TR-32 | Request labelled "close" that resolves to a new opposite order | **DENY** — label ignored |
+
+### 14.3 L3 — MT5 integration tests (blocked; specification only)
+
+**Template applied to every row:** *Setup* = restricted account in stated mode with stated
+positions; *Steps* = issue the operation from the stated channel; *Evidence* = callback log +
+position table + ledger diff; *Pass* = expected decision **and** expected before/after state **and**
+expected callback evidence, all three.
+
+| ID | Req | Mode | Channel | Scenario | Expected | Pass criteria |
+|---|---|---|---|---|---|---|
+| T-TR-001 | REQ-TR-01 | Both | Desktop | Open new position | **DENY** | No position created; no deal; no gateway traffic; preventive hook logged |
+| T-TR-002..005 | REQ-TR-01 | Both | Mobile · Web · EA · Manager | Same | **DENY** | As above, per channel |
+| T-TR-010 | REQ-TR-02 | Netting | Desktop | Same-side increase | **DENY** | Volume unchanged |
+| T-TR-020 | REQ-TR-03 | Hedging | Desktop | Opposing hedge open | **DENY** | No second position |
+| T-TR-030 | REQ-TR-04 | Netting | Desktop | Reversal | **DENY** | Original position intact |
+| T-TR-040 | PD-01 | Both | Desktop | Place pending **entry** order | **DENY** | Order not created |
+| T-TR-041 | PD-01 | Both | Server-generated | Inherited pending **activates** | **DENY** activation | No position. **Verifies server-generated actions reach a hook (§6.5)** |
+| T-TR-042 | PD-02 | Both | Desktop | Cancel pending order | **ALLOW** | Order removed |
+| T-TR-050 | REQ-TR-05/06 | Both | All | Full and partial closes | **ALLOW** | Position reduced/closed; **P/L settled correctly** |
+| T-TR-051 | REQ-TR-12 | Both | Server | SL hit · TP hit · stop-out | **ALLOW** | Exit executes normally |
+| T-TR-052 | REQ-TR-29 | Hedging | Desktop | Close By, equal and unequal volumes | **ALLOW** | Correct residual on the original side |
+| T-TR-053 | REQ-TR-30 | Hedging | Desktop | Close By where platform already forbids it | **DENY by platform** | Plugin did not enable it |
+| T-TR-060 | §6.5 | Both | **Copy/signal service** | Copied trade opens a position | **DENY** | **If it executes, this channel is an unenforced gap** |
+| T-TR-070 | REQ-TR-38 | Both | Server | Utility/rollover ticket change | Correct position matched | Decisions remain correct after ticket change |
+| T-TR-071 | REQ-TR-38 | Both | Desktop | Partial fill of an allowed close | **ALLOW**; remaining recomputed | Reservation releases only executed volume |
+| T-TR-072 | §6.6-b | Both | Desktop | Full close — inspect hook parameters | Decision correct | **Confirms zeroed-future-position handling** |
+| T-TR-073 | §6.6-c | Both | Multiple | Null-probe across all actions | No crash; deny on missing state | **No NULL dereference under any action** |
+| T-TR-080 | REQ-BR-04 | Both | All | **Unrestricted-account regression** | **ALL ALLOW** | **Zero behaviour change vs. baseline.** Run the full trading regression suite |
+
+**REQ-TST-04.** T-TR-080 is a **release gate**. A restriction plugin that degrades unrestricted
+accounts is a worse commercial outcome than no plugin. It MUST run against every execution mode
+OneRoyal actually uses in production — which MUST first be inventoried (currently unknown).
+
+### 14.4 L3/L5 — Funds and privileged paths (blocked)
+
+| ID | Req | Scenario | Expected | Pass criteria |
+|---|---|---|---|---|
+| T-FP-001 | REQ-FR-02 | Deposit via **every** production writer (CRM, Manager, API, each PSP) | **DENY at the pre-charge gate** | **No PSP charge occurs.** MT5-only rejection = **FAIL** |
+| T-FP-002 | REQ-FR-03 | Withdrawal, every writer | **DENY at gate** | No payout released |
+| T-FP-003 | REQ-FR-13 | Positive and negative balance operations, every writer | **DENY** (PD-08) | Ledger unchanged |
+| T-FP-020 | REQ-FR-04 | Native transfer — **all four** combinations (R→R, R→U, U→R, U→U) | First three **DENY**, fourth **ALLOW** | **Both endpoints checked before the first leg** |
+| T-FP-021 | §6.6-d | Transfer — log `Login` and `SourceLogin`, confirm which account was debited | Direction established | Resolves the sender/receiver question |
+| T-FP-022 | REQ-FR-09 | Two-leg transfer; kill between legs | Workflow recovers | No double-post; no stranded debit unreported |
+| T-FP-023 | REQ-FR-11 | Restriction activates **mid-transfer** | Node stays `RESTRICTING` | Exception queued to Finance Ops; **not auto-unwound** |
+| T-FP-024 | REQ-FR-09 | Retry with same idempotency key | Original outcome returned | No duplicate posting |
+| T-FP-030 | REQ-FR-08 | **Cross-server** transfer | **DENY at control plane** | Proves per-node check is insufficient |
+| T-FP-040 | §6.5 | Wallet movement involving restricted account | **DENY** | CRM gate enforced |
+| T-FP-050 | §6.6-e | `DealPerform` / direct privileged execution against restricted account | **DENY**, or **documented as an unenforced gap** | **Either outcome is acceptable evidence; silence is not** |
+| T-FP-051 | §6.6-f | History/correction/import/synchronisation methods | Classified live-vs-history | Each method's actual effect recorded |
+| T-FP-060 | PD-08 | Manual credit · bonus · correction · fee · negative-balance | **DENY** by default | Exceptions only via authorised path |
+| T-FP-061 | REQ-FR-14 | Attempt exception via comment · magic number · dealer login | **DENY all three** | **No back door exists** |
+| **T-FP-070** | **REQ-FR-12** | **Close a position on a restricted account with P/L, commission and swap** | **ALLOW — close settles fully** | **Critical: proves the funding restriction does not break legitimate closes** |
+| T-FP-080 | §11.4 | Run with OneRoyal's **actual** other plugins installed | Enforcement intact | **Confirms no other plugin short-circuits this one** |
+| T-FP-090 | REQ-SEC-03 | Unauthorised control command; replayed update; same-revision-different-content | **All rejected + audited** | No policy change applied |
+
+### 14.5 L4/L6 — Concurrency and resilience (blocked)
+
+| ID | Req | Scenario | Expected |
+|---|---|---|---|
+| T-CR-001 | REQ-ACT-09 | **Two concurrent 0.60 closes against BUY 1.00** | Exactly one allowed, or both partially within 1.00. **Never > 1.00 total. Never a reversal** |
+| T-CR-002 | REQ-ACT-12 | Manual close races an SL trigger | No overshoot; position never reverses |
+| T-CR-003 | REQ-ACT-12 | Duplicate request IDs | Idempotent — one effect |
+| T-CR-010 | REQ-ACT-10 | Reservation timeout with unresolved external execution | **Reservation NOT released** until reconciled |
+| T-CR-020 | REQ-ACT-02 | Request in flight during policy publication | Decided under a recorded revision; auditable |
+| T-CR-030 | REQ-ACT-15 | **External late fill after restriction** | Fill **booked correctly**, breach flagged, incident raised. **Never hidden or left unbooked** |
+| T-CR-031 | REQ-ACT-08 | Pending cancellation fails at gateway | Stays `RESTRICTING`; retries; alerts; **never reports RESTRICTED** |
+| T-CR-032 | REQ-ACT-08 | Order partially executes before cancellation | Position booked; activation-race exception raised |
+| T-RS-001 | REQ-PC-07 | Out-of-order / stale / same-revision-different-content updates | Correct accept/reject per §9.3 |
+| T-RS-010 | FM-04 | Persistence failure during update | Not activated; `DEGRADED`; alert |
+| T-RS-020 | FM-07 | **Process restart** | **Persisted snapshot loaded before serving any request.** Reservations re-derived |
+| T-RS-021 | FM-01 | Start with **no** policy file | `DEGRADED` + deny new exposure. **MUST NOT assume empty policy** |
+| T-RS-022 | FM-02 | Start with corrupt policy file | `DEGRADED`; previous not activated |
+| T-RS-030 | FM-05/06 | Controller unreachable; node partitioned | **No auto-unrestriction**; staleness alert |
+| T-RS-040 | FM-08 | **Failover to standby** | Standby enforces the same revision |
+| T-RS-050 | FM-10 | Plugin unloaded | **External** detection fires (not self-reported) |
+| T-RS-051 | FM-09 | API version mismatch | Plugin refuses to load **and** the operational response removes the server from service (REQ-FM-02) |
+| T-RS-060 | FM-12/13 | Load flooding; audit sink unavailable | Decisions unaffected; drops counted and alerted; **no blocking** |
+| T-RS-070 | REQ-PC-10 | Two restriction reasons; clear one | **Account stays restricted** |
+| T-RS-071 | REQ-PC-11 | Authorised unrestriction | Ordered release; audited; **cancelled pending orders NOT recreated** |
+| T-SEC-010 | §11.4 | Fuzz the control channel | No crash; all malformed input rejected |
+
+### 14.6 Acceptance criteria
+
+**REQ-TST-05.** Acceptance requires **both** directions proven — prohibition **and** availability:
+
+| Gate | Criterion |
+|---|---|
+| **G1 — Prohibition** | Every "Prevent" row of §4.1 has a passing **L3** test with preventive callback evidence, for **every** confirmed entry channel |
+| **G2 — Availability** | Every "Permit" row passes, including T-HG-008 (hedge-leg close), T-FP-070 (close settles), T-TR-051 (protective exits), T-TR-080 (unrestricted regression) |
+| **G3 — Funding** | Pre-charge gate proven at **L5** for every production writer. **MT5-only rejection does not satisfy G3** |
+| **G4 — Coverage honesty** | §6.5 contains **no** `unconfirmed` row for any channel in production use, or each remaining one is formally risk-accepted by Compliance |
+| **G5 — Resilience** | §14.5 passes, including restart, failover and late-fill handling |
+| **G6 — Blockers** | Every §16 blocker is closed or formally risk-accepted with a named accepting owner |
+
+**REQ-TST-06.** **No gate may be signed off on L1 evidence alone.** G1 and G3 specifically require
+live-environment evidence; a passing unit-test suite is a precondition, not a substitute.
+
+---
+
+## 15. Work packages, ownership and dependencies
+
+### 15.1 Required production work
+
+| WP | Package | Owner | Depends on | Blocked? |
+|---|---|---|---|---|
+| **WP-00** | **Obtain SDK; complete Appendix B worksheet** | Plugin dev + MT5 admin | SDK licence access | **Nothing — start immediately** |
+| **WP-01** | Policy engine library (§5) + L1/property tests | Plugin dev | — | **No — buildable today** |
+| WP-02 | SDK adapter (exports, sinks, translation, return codes) | Plugin dev | WP-00 | **Yes — on WP-00** |
+| WP-03 | Policy snapshot, persistence, admin interface (§9) | Plugin dev | WP-00 (transport, B-11) | Partially |
+| WP-04 | Activation coordinator + reservation ledger (§10) | Plugin dev | WP-00 (B-20) | Partially |
+| WP-05 | Audit + metrics + external detection (§12, §11.5) | Plugin dev + SRE | — | No |
+| **WP-06** | **Policy Controller** (authorise, version, distribute, reconcile) | Backend | §9 contract | **No — start in parallel** |
+| **WP-07** | **FXBO/CRM integration**: tag → authorised account list; **client→account expansion review** (§8.5) | CRM team | Tag schema **TBD** | **No — start now; long lead time** |
+| **WP-08** | **Payment pre-charge gate** (§7.2) — *authoritative funding control* | Payments | Writer inventory | **No — start now; critical path** |
+| WP-09 | Payment writer inventory + trace for **every** production writer (§7.1) | Payments + Finance | — | **No — start now** |
+| WP-10 | Transfer workflow: idempotency, durable state, reconciliation (§7.4) | Backend + Finance | WP-06 | No |
+| WP-11 | Test environment: MT5 test server, gateway sim, PSP sandbox | MT5 admin + QA | Licences | **Yes — procurement** |
+| WP-12 | Execute §14 (L1→L6) | QA | WP-01..11 | Yes |
+| WP-13 | Build/CI, signing, staged rollout, rollback (§13) | DevOps | WP-00 | Partially |
+| WP-14 | Operations runbook: DEGRADED, exceptions, late fills, emergency recovery | Ops + Compliance | §10, §11 | No |
+| WP-15 | Channel inventory: every route by which a trade or fund movement reaches MT5 | Platform owner | — | **No — start now; input to §6.5** |
+
+### 15.2 Optional enhancements (explicitly not required)
+
+| Package | Note |
+|---|---|
+| Client-side UI hints (greyed controls, custom messages) | **Cosmetic only.** MUST NOT be relied on for enforcement (REQ-OBS-05) |
+| Self-service status portal for Operations | Convenience over the §9 status API |
+| Automated reconciliation dashboard | Improves detection; not prevention |
+| `TRADING_ONLY` / `FUNDING_ONLY` restriction modes | Requires separate approval; not in the current requirement |
+
+### 15.3 Critical path
+
+**WP-00 → WP-02 → WP-12 → release** for trading, and **WP-09 → WP-08 → WP-12 → release** for
+funding. WP-08/WP-09 do **not** depend on the SDK and are likely the **longer** path. Starting them
+only after the plugin is written is the single most probable schedule failure in this programme.
+
+---
+
+## 16. Unresolved decisions and production release blockers
+
+**REQ-REL-01.** Each blocker below MUST be closed with recorded evidence, or formally risk-accepted
+by the named owner, before production release. **These MUST NOT be collapsed into a generic
+disclaimer** — in particular, BLK-02 and BLK-04 are financial/privileged-path gaps and must be
+visible to Compliance individually.
+
+| ID | Blocker | Unanswered question | Why sources are insufficient | Affected | Verification / vendor question | Owner | Acceptance evidence |
+|---|---|---|---|---|---|---|---|
+| **BLK-00** | **SDK not supplied** | Every interface question in §6 | **The four mandatory sources were never provided.** Nothing SDK-derived can be cited | All SDK requirements | Supply `MetaTrader5SDK.chm`, `API.zip`, `Manager.zip`, the plugin PDF; complete Appendix B | OneRoyal / MT5 admin | Completed Appendix B with file paths + line numbers |
+| **BLK-01** | **No preventive hook confirmed** | Is there a rejectable pre-execution hook on **every** trading channel? | Requires headers + CHM + live test | REQ-TR-01..04 | §6.3 classification + live test per channel | Plugin dev | Live evidence: rejection ⇒ no position, no deal, no gateway traffic |
+| **BLK-02** | **Funding prevention is not an MT5 capability** | Which production writers exist, and does each pass a pre-charge gate? | Depends on OneRoyal's CRM/PSP topology, not the SDK | REQ-FR-01..05 | WP-09 writer inventory; WP-08 gate; trace per writer | Payments + Compliance | Trace showing a veto **before** the economic leg, for **every** writer |
+| **BLK-03** | **Transfer endpoint semantics** (§6.6-d) | Which field is sender, which is receiver? | Header names alone are ambiguous | REQ-FR-04, audit accuracy | T-FP-021 in all four combinations | Plugin dev | Logged fields + confirmed debited account |
+| **BLK-04** | **Privileged-path bypass** (§6.6-e) | Does `DealPerform` / direct balance mutation bypass all hooks? | Documented as undocumented; needs vendor answer | REQ-FR-13, §11.4 | T-FP-050 + **vendor question:** *"Which Server/Manager API balance and deal methods can a plugin intercept **before** the ledger is modified?"* | Plugin dev + MetaQuotes | Written vendor answer **or** live evidence, plus an external gate if unenforceable |
+| **BLK-05** | **Cross-server transfers** | Who checks both endpoints when they are on different servers? | Production topology unknown | REQ-FR-08 | Control-plane check design + T-FP-030 | CRM + Architecture | Passing T-FP-030 |
+| **BLK-06** | **Channel inventory incomplete** | Copy trading, signals, gateways, third-party integrations — enumerated? | Not derivable from the SDK | §6.5 coverage | WP-15 | Platform owner | Signed-off channel list, each mapped to a §6.5 row |
+| **BLK-07** | **Concurrency guarantee unknown** (B-20) | Does the SDK serialize callbacks per account/position? | Needs threading documentation + runtime test | REQ-ACT-09..11 | Doc review + T-CR-001 | Plugin dev | Documented guarantee, **or** reservation ledger proven by T-CR-001 |
+| **BLK-08** | **Plugin-failure semantics** (B-22) | Does MT5 keep trading if the plugin fails to load? | Needs runtime test | REQ-FM-02 | T-RS-051 | MT5 admin | Observed behaviour + matching operational procedure |
+| **BLK-09** | **Payload limits** (B-21) | Real configuration/command payload capacity? | A code allocation ceiling is not a platform capacity | REQ-PC-14 | Empirical test + **vendor question:** *"What is the supported maximum plugin configuration payload size?"* | Plugin dev + MetaQuotes | Vendor answer or measured limit, plus chunking design if needed |
+| **BLK-10** | **Other-plugin ordering** (B-23) | Can another plugin short-circuit this one? | Needs OneRoyal's actual plugin set | §11.4 | T-FP-080 | MT5 admin | Passing test with the production plugin set |
+| **BLK-11** | **Production telemetry unknown** | Peak request rate, account counts, execution modes in use | Not supplied | REQ-BLD-07/08 | Extract from production | MT5 admin | Capacity figures feeding §13.4 |
+
+### 16.1 Open business decisions (OneRoyal — not technical blockers)
+
+| ID | Decision | Proposed default | Approver |
+|---|---|---|---|
+| PD-01 | Deny new pending entry orders + their activation | Deny | Ops/Dealing |
+| PD-02 | Permit pending cancellation | Permit | Ops/Dealing |
+| PD-03 | Remove inherited pending entries at activation | Remove | Ops/Dealing |
+| PD-04/05 | Permit SL/TP widening, removal and tightening | Permit | Ops/Dealing |
+| PD-06 | No automatic restriction expiry | No expiry | Compliance |
+| PD-07 | Pending orders that close positions | Validate reduce-only at activation | Ops/Dealing |
+| PD-08 | Credit/bonus/correction/fee/negative balance | Deny by default | Compliance + Finance |
+| PD-09 | Halt new exposure if audit storage is lost? | No for closes; yes for funding exceptions | Compliance |
+| PD-10 | Client→account tag expansion policy | Explicit review, never implicit | Compliance |
+| PD-11 | `DEGRADED`-and-serving vs. remove node from service | Serve in DEGRADED | Ops + Risk |
+
+**No approval, sign-off or deadline in this document has been obtained. All are proposals.**
+
+---
+
+## Appendix A — Requirement traceability matrix
+
+| Req ID | Requirement | Source | Design § | SDK mechanism | Test | Gate |
+|---|---|---|---|---|---|---|
+| REQ-BR-01 | Account-level granularity | Task §3 | §2.3, §8.5 | n/a | T-TR-080 | G2 |
+| REQ-BR-02 | `(platform_id, login)` key | Task §3 | §2.3, §9.1 | n/a | T-RS-001 | G4 |
+| REQ-BR-04 | Unlisted accounts unchanged | Task §3 | §4.3, §5.10 | n/a | **T-TR-080** | **G2** |
+| REQ-BR-05 | No permission granting | Task §3 | §4.3, §5.10 | n/a | T-TR-053 | G2 |
+| REQ-BR-10 | No group/symbol changes | Task §3 | §2.2 | **none — by design** | Code review + T-TR-080 | G4 |
+| REQ-TR-01 | No new positions | Task §3 | §5.3, §5.4 | **BLK-01** | T-TR-001..005 | G1 |
+| REQ-TR-02 | No volume increase | Task §3 | §5.3 | BLK-01 | T-NT-003, T-TR-010 | G1 |
+| REQ-TR-03 | No opposing hedge | Task §3 | §5.4 | BLK-01 | T-HG-004, T-TR-020 | G1 |
+| REQ-TR-04 | No reversal | Task §3 | §5.3 | BLK-01 | T-NT-004, T-TR-030 | G1 |
+| REQ-TR-05/06 | Permit full/partial close | Task §3 | §5.3, §5.4 | BLK-01 | T-NT-001/002, T-TR-050 | G2 |
+| REQ-TR-07 | Permit SL/TP modification | Task §3 | §5.8 | B-19 | T-SL-001..008 | G2 |
+| **REQ-TR-10** | **Not a net-exposure ceiling** | Task §5 | §4.4 | n/a | **T-HG-008** | **G2** |
+| REQ-TR-23 | Integer volume arithmetic | Task §5 | §5.2 | **B-14** | T-NT-006, P-06 | G1 |
+| REQ-TR-28 | No silent quantity rewriting | Task §5 | §5.4 | n/a | T-HG-003 | G2 |
+| REQ-TR-32 | No trust in labels | Task §5 | §5.6 | n/a | T-SL-009 | G1 |
+| REQ-TR-37 | Unknown action ⇒ deny | Task §4 | §5.9 | B-10 | P-08 | G1 |
+| REQ-FR-01/05 | Funding gate is external | Task §6 | §7.1, §7.2 | **BLK-02** | **T-FP-001/002** | **G3** |
+| REQ-FR-04 | Both transfer endpoints | Task §6 | §7.3 | BLK-03 | T-FP-020/021 | G3 |
+| REQ-FR-08 | Cross-server transfers | Task §6 | §7.3 | BLK-05 | T-FP-030 | G3 |
+| REQ-FR-09 | No atomicity claim | Task §6 | §7.4 | n/a | T-FP-022/024 | G3 |
+| **REQ-FR-12** | **Do not break close settlement** | Task §6 | §7.6 | n/a | **T-FP-070** | **G2** |
+| REQ-FR-14 | No back-door exceptions | Task §6 | §7.7 | n/a | T-FP-061 | G3 |
+| REQ-AR-05 | No blocking I/O in callbacks | Task §7 | §8.4 | B-07, B-20 | T-RS-060 | G5 |
+| REQ-PC-05 | Accepted ≠ Enforced | Task §8 | §9.2 | n/a | T-CR-031 | G4 |
+| REQ-PC-09 | No auto-unrestriction | Task §8 | §9.5 | n/a | T-RS-030 | G5 |
+| REQ-PC-10 | Multiple reasons independent | Task §8 | §9.5 | n/a | T-RS-070 | G5 |
+| REQ-PC-14 | Verify real payload limits | Task §8 | §9.6 | **BLK-09** | — | G6 |
+| REQ-ACT-06 | Ack ≠ config save | Task §9 | §10.3 | n/a | T-CR-031 | G4 |
+| REQ-ACT-08 | DB row ≠ gateway cancel | Task §9 | §10.4 | BLK-06 | T-CR-031/032 | G5 |
+| REQ-ACT-09..11 | Joint-overshoot prevention | Task §9 | §10.5 | **BLK-07** | **T-CR-001** | G5 |
+| REQ-ACT-14 | Never leave fills unbooked | Task §9 | §10.6 | n/a | T-CR-030 | G5 |
+| REQ-FM-02 | Plugin refusal ≠ server stop | Task §10 | §11.2 | **BLK-08** | T-RS-051 | G5 |
+| REQ-SEC-01 | Admins inside trust boundary | Task §10 | §11.4 | n/a | Documented | G6 |
+| REQ-SEC-08 | No unrestricted fallback | Task §10 | §11.5 | n/a | T-RS-021/022 | G5 |
+| REQ-OBS-03 | Preserve normal routing | Task §11 | §12.1 | **B-24, §6.6-a** | T-TR-080 | G1 |
+| REQ-OBS-10 | Detection ≠ prevention | Task §11 | §12.5 | n/a | Review | G4 |
+| REQ-BLD-05 | Keep compiler protections | Task §12 | §13.2 | B-25 | Build config review | G6 |
+| REQ-BLD-14 | Rollback preserves restrictions | Task §12 | §13.5 | n/a | Rollback drill | G5 |
+
+## Appendix B — SDK verification worksheet
+
+**Instruction to the developer:** complete every row **from the actual files**. Record
+`file path : line number` only for files actually opened. Record header-vs-documentation
+disagreements explicitly with their design effect (REQ-EV-01). An unanswered row is a blocker, not
+an assumption.
+
+| ID | Question | Source to inspect | Evidence required | Status |
+|---|---|---|---|---|
+| B-01 | Plugin lifecycle exports, calling convention, version negotiation | `API.zip` headers + PDF | Signatures + file:line + PDF page | 🔴 Open |
+| B-02 | Request-admission hook: stage, rejectability, populated objects | Headers + CHM | Signature + stage + rejection effect | 🔴 Open |
+| B-03 | Routing hook: obsolete/NULL params; "done" return semantics (§6.6-a) | Headers + CHM + live | Which return means *continue normally* | 🔴 Open |
+| B-04 | Processing hook: future-position semantics (§6.6-b); rejectability | Headers + CHM + live | Field dump per operation type | 🔴 Open |
+| B-05 | Close-By hook: both positions visible; rejectable | Headers + CHM | Signature + parameters | 🔴 Open |
+| B-06 | Execution hooks: **preventive or notification?** | Headers + CHM + live | §6.3 classification evidence | 🔴 Open |
+| B-07 | Which SDK reads are legal inside each callback (reentrancy) | CHM + live | Documented constraints + test | 🔴 Open |
+| B-08 | Financial actions/methods: which are interceptable pre-ledger | Headers + CHM + `Manager.zip` + live | Per-method classification | 🔴 Open |
+| B-09 | Privileged ops: live mutation vs. history-only; interceptability | Headers + CHM + live | Per-method classification | 🔴 Open |
+| B-10 | Complete action enumerator list + flags | Headers | Full enum with file:line | 🔴 Open |
+| B-11 | Update channel: configuration events vs. custom commands | Headers + CHM + `Manager.zip` | Mechanism + permissions + limits | 🔴 Open |
+| B-14 | Integer volume units; legacy vs. extended volume fields | Headers | Constant + field names + scale | 🔴 Open |
+| B-15 | Stable position identifier across rollover/ticket change | CHM | Identifier semantics | 🔴 Open |
+| B-18 | Deal entry classification enum; available pre- or post-execution? | Headers + CHM | Enum + availability stage | 🔴 Open |
+| B-19 | Object nullability per action (§6.6-c) | Headers + CHM + live | Null-probe matrix | 🔴 Open |
+| B-20 | Threading: concurrent callbacks? per-account serialization? | CHM + live | Documented guarantee or its absence | 🔴 Open |
+| B-21 | Real configuration/command payload limits | CHM + **vendor** | Vendor answer or measured limit | 🔴 Open |
+| B-22 | Does MT5 keep trading if a plugin fails to load? | CHM + live | Observed behaviour | 🔴 Open |
+| B-23 | Multi-plugin callback ordering / short-circuiting | CHM + live | Documented order + test | 🔴 Open |
+| B-24 | Return codes per hook: allow / reject / side effects | Headers + CHM + live | Per-hook mapping table | 🔴 Open |
+| B-25 | Toolchain, CRT, Unicode, ABI, ownership/Release rules | Headers + PDF | Build requirements + PDF pages | 🔴 Open |
+| B-26 | SDK version identifier of OneRoyal's licensed copy | Headers | Version constant + file:line | 🔴 Open |
+
+**Status: 0 of 22 rows answered. All 🔴 Open.**
+
+## Appendix C — Representative declarations and pseudocode
+
+> **Illustrative only.** These are **not** SDK declarations. They show the *shape* of the adapter and
+> the ownership discipline required. Real declarations MUST be taken verbatim from the supplied
+> headers (REQ-BLD-01). Nothing here is compilable against the real SDK, and none of it has been
+> compiled.
+
+```cpp
+// ---- Plain structs: the boundary between SDK and policy (no SDK types cross it) ----
+struct PositionView {
+    std::uint64_t ticket      = 0;
+    std::uint64_t position_id = 0;      // stable across rollover — B-15
+    std::uint64_t login       = 0;
+    char          symbol[32]  = {};
+    Direction     direction   = Direction::None;
+    VolumeUnits   volume      = 0;      // integer units — B-14
+    Mode          mode        = Mode::Netting;
+    bool          valid       = false;  // false ⇒ DENY (never "allow by default")
+};
+
+struct Decision {
+    bool          allowed   = false;    // default-deny: a default-constructed Decision denies
+    ReasonCode    reason    = ReasonCode::ERR_STATE_UNAVAILABLE;
+    std::uint64_t policy_rev = 0;
+    std::uint64_t correlation_id = 0;
+};
+
+// ---- Pure policy: no SDK, no I/O, no allocation, fully unit-testable today ----
+namespace policy {
+    Decision EvaluateNetting (const RequestView&, const PositionView&) noexcept;
+    Decision EvaluateHedging (const RequestView&, const PositionView&) noexcept;
+    Decision EvaluateCloseBy (const RequestView&, const PositionView& a,
+                                                  const PositionView& b) noexcept;
+    Decision ValidateProtectiveLevels(const RequestView&, const PositionView&) noexcept;
+}
+
+// ---- RAII ownership for SDK interfaces (REQ-BLD-02) ----
+// Exact Release semantics MUST be confirmed (B-25) before this is used.
+template <typename T>
+class SdkRef {
+    T* p_ = nullptr;
+public:
+    explicit SdkRef(T* p) noexcept : p_(p) {}
+    ~SdkRef() { if (p_) p_->Release(); }            // ownership is structural, not remembered
+    SdkRef(const SdkRef&)            = delete;
+    SdkRef& operator=(const SdkRef&) = delete;
+    SdkRef(SdkRef&& o) noexcept : p_(std::exchange(o.p_, nullptr)) {}
+    T* get() const noexcept { return p_; }
+    explicit operator bool() const noexcept { return p_ != nullptr; }
+};
+
+// ---- Adapter hook skeleton (signature is a PLACEHOLDER — see B-04) ----
+SdkReturnCode OnTradeRequestProcess_PLACEHOLDER(/* real params from headers */) noexcept
+{
+    try {
+        // 1. Translate SDK objects → plain structs. Null-check EVERYTHING (B-19, §6.6-c).
+        RequestView q;
+        if (!Translate(/*sdk request*/, q)) return RejectCode();   // missing data ⇒ DENY
+
+        // 2. Pure decision. No I/O. No locks held across SDK calls (§8.4).
+        const Decision d = policy::Evaluate(q);
+
+        // 3. Non-blocking audit enqueue — MUST NOT block the trading path (REQ-OBS-08).
+        audit::TryEnqueue(d, q);
+
+        // 4. Map to the SDK return code. The ALLOW value MUST be the one that means
+        //    "continue normal routing" — verified by live test, NOT inferred (B-24, §6.6-a).
+        return d.allowed ? AllowCode() : RejectCode();
+    }
+    catch (...) {
+        // FM-11: never let an exception escape into the server. Deny and alert.
+        audit::TryEnqueueException();
+        return RejectCode();
+    }
+}
+```
+
+## Appendix D — Representative control messages
+
+> `Proposed design`. Field names/types are OneRoyal-owned; the transport is **TBD** (B-11).
+> 64-bit logins are **strings** (REQ-PC-03).
+
+```jsonc
+// Full snapshot
+{
+  "schema_version": 1,
+  "message_type": "policy_snapshot",
+  "platform_id": "ORL-LIVE-1",
+  "revision": 10427,
+  "issued_at": "2026-09-19T10:14:22Z",
+  "total_count": 3,                    // MUST match entries length
+  "intentional_empty": false,          // MUST be true for a deliberate empty list (§9.3)
+  "content_hash": "sha256:1f3a…",
+  "entries": [
+    { "login": "10054321", "mode": "FULL",
+      "reasons": [ { "code": "COMPLIANCE_REVIEW", "ref": "CASE-8871",
+                     "approved_by": "compliance.jsmith", "since": "2026-09-19T10:12:00Z" } ] },
+    { "login": "10054322", "mode": "FULL",
+      "reasons": [ { "code": "COMPLIANCE_REVIEW", "ref": "CASE-8871", "approved_by": "compliance.jsmith" },
+                   { "code": "PAYMENT_DISPUTE",  "ref": "PAY-2231",  "approved_by": "finance.arivera" } ] },
+      // ^ two independent reasons: clearing one MUST NOT unrestrict (REQ-PC-10)
+    { "login": "10054999", "mode": "FULL",
+      "reasons": [ { "code": "MANUAL", "ref": "OPS-118", "approved_by": "ops.tchen" } ] }
+  ],
+  "signature": "…"                     // REQ-SEC-05
+}
+
+// Status response — ACCEPTED and ENFORCED are different (REQ-PC-05)
+{
+  "message_type": "policy_status",
+  "platform_id": "ORL-LIVE-1",
+  "login": "10054321",
+  "desired_state": "RESTRICTED",
+  "controller_state": "ACCEPTED",
+  "enforcement_state": "RESTRICTING",   // NOT yet fully enforced
+  "nodes": [
+    { "node_id": "mt5-trade-01", "state": "RESTRICTED",  "revision": 10427, "enforced_at": "2026-09-19T10:14:25Z" },
+    { "node_id": "mt5-trade-02", "state": "RESTRICTING", "revision": 10427, "enforced_at": null,
+      "blocking": [ "pending_order_cancel_unacked:ticket=55120" ] }   // §10.3 barrier 5
+  ],
+  "in_flight_funding_ops": 0,
+  "caveat": "Status reflects this plugin's own view. It is not evidence that pathways outside the plugin are covered (REQ-PC-13)."
+}
+
+// Rejection audit record (§12.3)
+{
+  "message_type": "enforcement_audit",
+  "timestamp": "2026-09-19T10:16:03.418Z",
+  "correlation_id": "c8f1-…",
+  "platform_id": "ORL-LIVE-1", "node_id": "mt5-trade-01",
+  "login": "10054321", "action": "TRADE_BUY", "symbol": "EURUSD",
+  "position_ticket": 55118,
+  "existing_volume_units": 100000, "requested_volume_units": 20000,
+  "resulting_volume_units": null,
+  "decision": "DENY", "reason_code": "ERR_VOLUME_INCREASE",
+  "policy_revision": 10427,
+  "control_type": "PREVENTIVE"          // MUST be "DETECTIVE" for post-event records (REQ-OBS-10)
+}
+```
+
+## Appendix E — Source index
+
+| # | Source | Status | Cited in this document |
+|---|---|---|---|
+| S-01 | `MetaTrader5SDK.chm` | **Not supplied — not read** | **Never** |
+| S-02 | `API.zip` (headers) | **Not supplied — not read** | **Never** |
+| S-03 | `Manager.zip` (examples) | **Not supplied — not read** | **Never** |
+| S-04 | *Creating a Simple Plugin — Server API* (PDF) | **Not supplied — not read** | **Never** |
+| S-05 | `MT5_Account_Restriction_Review.html` (optional) | **Not supplied — not read** | **Never** |
+| S-06 | `MT5_Account_Restriction_Reference_v0.1.zip` (optional) | **Not supplied — not read** | **Never** |
+| S-07 | OneRoyal task specification (the prompt) | **Supplied — read** | Throughout, as `Project requirement` |
+
+**No external source was consulted.** No MQL5 terminal-API documentation was substituted for Server
+API evidence (REQ-EV-03). **SDK version reviewed: UNKNOWN** (S-02 absent).
+**Total SDK citations in this document: 0.**
+
+## Appendix F — Glossary
+
+| Term | Meaning |
+|---|---|
+| **Netting** | One net position per symbol per account. |
+| **Hedging** | Multiple independent positions per symbol, including opposite directions. |
+| **Close By** | Closing two opposite positions on the same symbol against each other. |
+| **Reduce-only** | Strictly decreases position volume without crossing zero. |
+| **Reversal** | Opposite operation exceeding existing volume, leaving opposite exposure. |
+| **Preventive control** | Rejects before the point of no return. Enforcement. |
+| **Detective control** | Observes after the fact. Not enforcement. |
+| **Point of no return** | After which the economic effect cannot be withdrawn. |
+| **Stranded payment** | Money moved externally; MT5 ledger not updated. |
+| **Snapshot revision** | Monotonic version of the effective policy. |
+| **Reservation** | A hold on position volume preventing concurrent joint overshoot. |
+| **Activation barrier** | Conditions all satisfied before reporting RESTRICTED. |
+| **DEGRADED** | Enforcement uncertain: deny new exposure and funding; permit exits. |
+
+---
+
+## Final pre-delivery checklist
+
+| Check (required by the task) | Result |
+|---|---|
+| No design changes account groups or instruments | ✅ §2.2 prohibits it; reads only for validation |
+| No preventive claim relies only on a post-event notification | ✅ §6.3, §12.5; execution hooks explicitly unclassified pending B-06 |
+| No transfer omits an endpoint | ✅ §7.3 checks both; all four combinations tested (T-FP-020) |
+| No valid reduction confused with a new hedge/reversal | ✅ §5.3/§5.4; T-HG-008 guards the hedge-leg false denial |
+| No failure procedure silently clears restrictions | ✅ §9.5, §11.1; no auto-unrestriction path exists |
+| No integration or test represented as implemented | ✅ All tests **NOT RUN**; §6.5 rows `unconfirmed`; Appendix E records 0 citations |
+| Code not claimed compiled, tested or production-ready | ✅ Appendix C labelled illustrative and uncompiled |
+| Full document produced, not an outline | ✅ §§1–16 + Appendices A–F complete |
+
+**Document ends.**
